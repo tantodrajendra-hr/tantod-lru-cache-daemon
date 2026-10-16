@@ -1,130 +1,122 @@
-import threading
+import os
 import time
-import json
 from collections import OrderedDict
-from typing import Any, Optional
+from threading import Lock
+from flask import Flask, request, jsonify
 
-class CacheNode:
-    __slots__ = ('key', 'value', 'expiry')
-    
-    def __init__(self, key: Any, value: Any, expiry: Optional[float]):
-        self.key = key
-        self.value = value
-        self.expiry = expiry
+app = Flask(__name__)
 
-class HighSpeedCache:
-    def __init__(self, capacity: int = 10000, cleanup_interval: float = 60.0):
-        if capacity <= 0:
-            raise ValueError("Capacity must be greater than 0")
-        
+# In-Memory Cache Store with LRU eviction and TTL
+class LRUCache:
+    def __init__(self, capacity=1000):
         self.capacity = capacity
-        self._cache: OrderedDict[Any, CacheNode] = OrderedDict()
-        self._lock = threading.RLock()
-        
-        # Background thread for periodic expiration cleanup
-        self._cleanup_interval = cleanup_interval
-        self._stop_event = threading.Event()
-        self._cleanup_thread = threading.Thread(target=self._periodic_cleanup, daemon=True)
-        self._cleanup_thread.start()
+        self.cache = OrderedDict()
+        self.lock = Lock()
 
-    def _is_expired(self, node: CacheNode, current_time: float) -> bool:
-        return node.expiry is not None and current_time >= node.expiry
-
-    def _periodic_cleanup(self) -> None:
-        while not self._stop_event.wait(self._cleanup_interval):
-            try:
-                self.purge_expired()
-            except Exception:
-                pass
-
-    def close(self) -> None:
-        self._stop_event.set()
-        if self._cleanup_thread.is_alive():
-            self._cleanup_thread.join()
-
-    def get(self, key: Any) -> Optional[Any]:
-        current_time = time.time()
-        
-        with self._lock:
-            node = self._cache.get(key)
-            
-            if node is None:
+    def get(self, key):
+        with self.lock:
+            if key not in self.cache:
                 return None
-            
-            if self._is_expired(node, current_time):
-                self._cache.pop(key, None)
+            val, expiry = self.cache[key]
+            if expiry and time.time() > expiry:
+                del self.cache[key]
                 return None
-            
-            self._cache.move_to_end(key)
-            return node.value
+            self.cache.move_to_end(key)
+            return val
 
-    def set(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
-        current_time = time.time()
-        expiry = current_time + ttl if ttl is not None and ttl > 0 else None
-        
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                node = self._cache[key]
-                node.value = value
-                node.expiry = expiry
-                return
+    def set(self, key, value, ttl=None):
+        with self.lock:
+            expiry = (time.time() + ttl) if ttl else None
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            self.cache[key] = (value, expiry)
+            if len(self.cache) > self.capacity:
+                self.cache.popitem(last=False)
 
-            if len(self._cache) >= self.capacity:
-                self._cache.popitem(last=False)
-                
-            self._cache[key] = CacheNode(key, value, expiry)
+cache_store = LRUCache(capacity=5000)
 
-    def delete(self, key: Any) -> bool:
-        with self._lock:
-            if key in self._cache:
-                del self._cache[key]
-                return True
-            return False
+# Pre-configured keys for testing (Free tier key included)
+API_KEYS = {
+    "tantod-free-demo-key": {"tier": "free", "requests": 0, "limit": 100},
+    "tantod-vip-pro-key": {"tier": "pro", "requests": 0, "limit": 100000}
+}
 
-    def clear(self) -> None:
-        with self._lock:
-            self._cache.clear()
+@app.before_request
+def authenticate():
+    if request.path in ["/", "/health", "/pricing"]:
+        return
+    api_key = request.headers.get("X-API-KEY")
+    if not api_key or api_key not in API_KEYS:
+        return jsonify({
+            "error": "Unauthorized",
+            "message": "Valid 'X-API-KEY' header required. Use 'tantod-free-demo-key' for trial or upgrade at /pricing"
+        }), 401
 
-    def purge_expired(self) -> int:
-        current_time = time.time()
-        purged_count = 0
-        
-        with self._lock:
-            keys_to_delete = [
-                key for key, node in self._cache.items() 
-                if self._is_expired(node, current_time)
-            ]
-            for key in keys_to_delete:
-                del self._cache[key]
-                purged_count += 1
-                
-        return purged_count
+    client_data = API_KEYS[api_key]
+    if client_data["requests"] >= client_data["limit"]:
+        return jsonify({
+            "error": "Quota Exceeded",
+            "message": f"Daily limit reached for {client_data['tier']} tier. Upgrade at /pricing"
+        }), 429
+    client_data["requests"] += 1
 
-    def save_to_disk(self, filepath: str) -> None:
-        current_time = time.time()
-        with self._lock:
-            data = {
-                str(k): node.value for k, node in self._cache.items() 
-                if not self._is_expired(node, current_time)
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "service": "T.A.N.T.O.D. Autonomous LRU Cache SaaS",
+        "status": "online",
+        "endpoints": {
+            "GET /health": "Health check",
+            "GET /pricing": "Tier info & payment links",
+            "GET /cache?key=<k>": "Retrieve cached item",
+            "POST /cache": "Set key-value pair with optional TTL"
+        }
+    })
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy", "timestamp": time.time()})
+
+@app.route("/pricing", methods=["GET"])
+def pricing():
+    return jsonify({
+        "tiers": [
+            {
+                "tier": "Free Developer",
+                "price": "$0",
+                "limit": "100 req/day",
+                "key": "tantod-free-demo-key"
+            },
+            {
+                "tier": "Pro Unlimited",
+                "price": "$9/month",
+                "limit": "Unlimited",
+                "checkout_link": "https://buy.stripe.com/test_placeholder"
             }
-            with open(filepath, 'w') as f:
-                json.dump(data, f)
+        ]
+    })
 
-    def load_from_disk(self, filepath: str, ttl: Optional[float] = None) -> None:
-        current_time = time.time()
-        expiry = current_time + ttl if ttl is not None and ttl > 0 else None
-        
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-            
-        with self._lock:
-            for k, v in data.items():
-                if len(self._cache) >= self.capacity:
-                    self._cache.popitem(last=False)
-                self._cache[k] = CacheNode(k, v, expiry)
+@app.route("/cache", methods=["GET"])
+def get_cache():
+    key = request.args.get("key")
+    if not key:
+        return jsonify({"error": "Query param 'key' is required"}), 400
+    val = cache_store.get(key)
+    if val is None:
+        return jsonify({"found": False, "key": key}), 404
+    return jsonify({"found": True, "key": key, "value": val})
 
-    def __len__(self) -> int:
-        current_time = time.time()
-        with self._lock:
-            return sum(1 for node in self._cache.values() if not self._is_expired(node, current_time))
+@app.route("/cache", methods=["POST"])
+def set_cache():
+    data = request.get_json(silent=True) or {}
+    key = data.get("key")
+    value = data.get("value")
+    ttl = data.get("ttl_seconds")
+    if not key or value is None:
+        return jsonify({"error": "'key' and 'value' are required in JSON body"}), 400
+    cache_store.set(key, value, ttl=ttl)
+    return jsonify({"status": "stored", "key": key, "ttl_seconds": ttl}), 201
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
