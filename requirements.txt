@@ -1,0 +1,3 @@
+text
+# This code uses only Python built-in modules (threading, time, json, collections, typing).
+# No external package requirements.
