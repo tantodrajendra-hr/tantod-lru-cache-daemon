@@ -35,7 +35,7 @@ class LRUCache:
 
 cache_store = LRUCache(capacity=5000)
 
-# Pre-configured keys for testing (Free tier key included)
+# Pre-configured keys for testing (Free tier demo key included)
 API_KEYS = {
     "tantod-free-demo-key": {"tier": "free", "requests": 0, "limit": 100},
     "tantod-vip-pro-key": {"tier": "pro", "requests": 0, "limit": 100000}
@@ -63,8 +63,9 @@ def authenticate():
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "service": "T.A.N.T.O.D. Autonomous LRU Cache SaaS",
+        "service": "T.A.N.T.O.D. Cloud Systems - LRU Cache Daemon",
         "status": "online",
+        "version": "1.0.0",
         "endpoints": {
             "GET /health": "Health check",
             "GET /pricing": "Tier info & payment links",
@@ -83,15 +84,15 @@ def pricing():
         "tiers": [
             {
                 "tier": "Free Developer",
-                "price": "$0",
+                "price": "£0",
                 "limit": "100 req/day",
                 "key": "tantod-free-demo-key"
             },
             {
                 "tier": "Pro Unlimited",
-                "price": "$9/month",
-                "limit": "Unlimited",
-                "checkout_link": "https://buy.stripe.com/test_placeholder"
+                "price": "£9/month",
+                "limit": "Unlimited requests, 5k cached items",
+                "checkout_link": "https://buy.stripe.com/test_6oU28teeEbEV5DmeTl0ZW00"
             }
         ]
     })
