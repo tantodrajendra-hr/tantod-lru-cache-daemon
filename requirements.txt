@@ -1,2 +1,3 @@
 text
-# No external dependencies required (uses standard library only)
+# The provided code relies entirely on Python built-in modules 
+# (time, threading, typing) and requires no external dependencies.
