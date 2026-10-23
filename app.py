@@ -1,123 +1,160 @@
-import os
+import json
 import time
-from collections import OrderedDict
-from threading import Lock
-from flask import Flask, request, jsonify
+import threading
+from typing import Generic, TypeVar, Optional, Dict
 
-app = Flask(__name__)
+K = TypeVar('K')
+V = TypeVar('V')
 
-# In-Memory Cache Store with LRU eviction and TTL
-class LRUCache:
-    def __init__(self, capacity=1000):
+class Node(Generic[K, V]):
+    __slots__ = ('key', 'value', 'expiry', 'prev', 'next')
+    def __init__(self, key: Optional[K] = None, value: Optional[V] = None, expiry: float = 0.0):
+        self.key: Optional[K] = key
+        self.value: Optional[V] = value
+        self.expiry: float = expiry
+        self.prev: Optional['Node[K, V]'] = None
+        self.next: Optional['Node[K, V]'] = None
+
+class LRUCacheWithTTL(Generic[K, V]):
+    def __init__(self, capacity: int = 10000):
+        if capacity <= 0:
+            raise ValueError("Capacity must be greater than 0")
         self.capacity = capacity
-        self.cache = OrderedDict()
-        self.lock = Lock()
+        self.map: Dict[K, Node[K, V]] = {}
+        self.lock = threading.RLock()
+        
+        self.head = Node[K, V]()
+        self.tail = Node[K, V]()
+        self.head.next = self.tail
+        self.tail.prev = self.head
 
-    def get(self, key):
+    def _remove(self, node: Node[K, V]) -> None:
+        p = node.prev
+        n = node.next
+        if p is not None:
+            p.next = n
+        if n is not None:
+            n.prev = p
+        node.prev = None
+        node.next = None
+
+    def _add_to_front(self, node: Node[K, V]) -> None:
+        n = self.head.next
+        self.head.next = node
+        node.prev = self.head
+        node.next = n
+        if n is not None:
+            n.prev = node
+
+    def _evict(self) -> None:
+        now = time.time()
+        # Eviction Optimization: Prefer evicting expired entries first if available
+        current = self.tail.prev
+        while current is not None and current != self.head:
+            if current.expiry != 0.0 and now >= current.expiry:
+                prev_node = current.prev
+                self._remove(current)
+                if current.key is not None:
+                    self.map.pop(current.key, None)
+                current = prev_node
+            else:
+                break
+
+        # If after checking expired items we still need to evict (or none were expired), evict the actual LRU
+        lru = self.tail.prev
+        if lru is not None and lru != self.head:
+            self._remove(lru)
+            if lru.key is not None:
+                self.map.pop(lru.key, None)
+
+    def _is_expired(self, node: Node[K, V], now: float) -> bool:
+        return node.expiry != 0.0 and now >= node.expiry
+
+    def set(self, key: K, value: V, ttl: Optional[float] = None) -> None:
+        now = time.time()
+        expiry = now + ttl if ttl is not None and ttl > 0 else 0.0
+
         with self.lock:
-            if key not in self.cache:
-                return None
-            val, expiry = self.cache[key]
-            if expiry and time.time() > expiry:
-                del self.cache[key]
-                return None
-            self.cache.move_to_end(key)
-            return val
+            if key in self.map:
+                node = self.map[key]
+                node.value = value
+                node.expiry = expiry
+                self._remove(node)
+                self._add_to_front(node)
+                return
 
-    def set(self, key, value, ttl=None):
+            if len(self.map) >= self.capacity:
+                self._evict()
+
+            node = Node(key=key, value=value, expiry=expiry)
+            self._add_to_front(node)
+            self.map[key] = node
+
+    def get(self, key: K) -> Optional[V]:
+        now = time.time()
         with self.lock:
-            expiry = (time.time() + ttl) if ttl else None
-            if key in self.cache:
-                self.cache.move_to_end(key)
-            self.cache[key] = (value, expiry)
-            if len(self.cache) > self.capacity:
-                self.cache.popitem(last=False)
+            if key not in self.map:
+                return None
+            
+            node = self.map[key]
+            if self._is_expired(node, now):
+                self._remove(node)
+                self.map.pop(key, None)
+                return None
 
-cache_store = LRUCache(capacity=5000)
+            self._remove(node)
+            self._add_to_front(node)
+            return node.value
 
-# Pre-configured keys for testing (Free tier demo key included)
-API_KEYS = {
-    "tantod-free-demo-key": {"tier": "free", "requests": 0, "limit": 100},
-    "tantod-vip-pro-key": {"tier": "pro", "requests": 0, "limit": 100000}
-}
+    def delete(self, key: K) -> bool:
+        with self.lock:
+            if key not in self.map:
+                return False
+            node = self.map.pop(key)
+            self._remove(node)
+            return True
 
-@app.before_request
-def authenticate():
-    if request.path in ["/", "/health", "/pricing"]:
-        return
-    api_key = request.headers.get("X-API-KEY")
-    if not api_key or api_key not in API_KEYS:
-        return jsonify({
-            "error": "Unauthorized",
-            "message": "Valid 'X-API-KEY' header required. Use 'tantod-free-demo-key' for trial or upgrade at /pricing"
-        }), 401
+    def clear(self) -> None:
+        with self.lock:
+            # Memory Management: Ensure all nodes are properly unlinked from the list
+            while self.head.next and self.head.next != self.tail:
+                node_to_remove = self.head.next
+                self._remove(node_to_remove)
+            self.map.clear()
+            self.head.next = self.tail
+            self.tail.prev = self.head
 
-    client_data = API_KEYS[api_key]
-    if client_data["requests"] >= client_data["limit"]:
-        return jsonify({
-            "error": "Quota Exceeded",
-            "message": f"Daily limit reached for {client_data['tier']} tier. Upgrade at /pricing"
-        }), 429
-    client_data["requests"] += 1
+    def __len__(self) -> int:
+        now = time.time()
+        with self.lock:
+            expired_keys = [
+                k for k, node in self.map.items() 
+                if self._is_expired(node, now)
+            ]
+            for k in expired_keys:
+                node = self.map.pop(k, None)
+                if node:
+                    self._remove(node)
+            return len(self.map)
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "service": "T.A.N.T.O.D. Cloud Systems - LRU Cache Daemon",
-        "status": "online",
-        "version": "1.0.0",
-        "endpoints": {
-            "GET /health": "Health check",
-            "GET /pricing": "Tier info & payment links",
-            "GET /cache?key=<k>": "Retrieve cached item",
-            "POST /cache": "Set key-value pair with optional TTL"
-        }
-    })
+    def save(self, filename: str) -> None:
+        with self.lock:
+            now = time.time()
+            data = []
+            for k, node in self.map.items():
+                if not self._is_expired(node, now):
+                    ttl = node.expiry - now if node.expiry != 0.0 else None
+                    data.append({'key': k, 'value': node.value, 'ttl': ttl})
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "healthy", "timestamp": time.time()})
-
-@app.route("/pricing", methods=["GET"])
-def pricing():
-    return jsonify({
-        "tiers": [
-            {
-                "tier": "Free Developer",
-                "price": "£0",
-                "limit": "100 req/day",
-                "key": "tantod-free-demo-key"
-            },
-            {
-                "tier": "Pro Unlimited",
-                "price": "£9/month",
-                "limit": "Unlimited requests, 5k cached items",
-                "checkout_link": "https://buy.stripe.com/test_6oU28teeEbEV5DmeTl0ZW00"
-            }
-        ]
-    })
-
-@app.route("/cache", methods=["GET"])
-def get_cache():
-    key = request.args.get("key")
-    if not key:
-        return jsonify({"error": "Query param 'key' is required"}), 400
-    val = cache_store.get(key)
-    if val is None:
-        return jsonify({"found": False, "key": key}), 404
-    return jsonify({"found": True, "key": key, "value": val})
-
-@app.route("/cache", methods=["POST"])
-def set_cache():
-    data = request.get_json(silent=True) or {}
-    key = data.get("key")
-    value = data.get("value")
-    ttl = data.get("ttl_seconds")
-    if not key or value is None:
-        return jsonify({"error": "'key' and 'value' are required in JSON body"}), 400
-    cache_store.set(key, value, ttl=ttl)
-    return jsonify({"status": "stored", "key": key, "ttl_seconds": ttl}), 201
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    def load(self, filename: str) -> None:
+        with self.lock:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.clear()
+                now = time.time()
+                for item in data:
+                    expiry = item.get('ttl')
+                    actual_ttl = expiry if expiry is not None and expiry > 0 else None
+                    self.set(item['key'], item['value'], ttl=actual_ttl)
